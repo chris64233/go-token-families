@@ -27,3 +27,19 @@ func digest(token string) string {
 	sum := sha256.Sum256([]byte(token))
 	return hex.EncodeToString(sum[:])
 }
+
+// keyDigest 计算设备公钥的不可逆摘要（SHA-256，十六进制编码）。
+// 持久化层只保存该摘要，绝不保存公钥本身；公钥与签名只在请求处理
+// 过程中短暂出现于内存。
+func keyDigest(publicKey []byte) string {
+	return KeyDigest(publicKey)
+}
+
+// KeyDigest 返回设备公钥的不可逆摘要（SHA-256，十六进制编码）。
+// 导出它是因为设备更换的确认签名消息（DeviceChangeConfirmMessage）
+// 必须包含新设备公钥摘要，旧设备客户端需要按同一约定计算该值；
+// 服务持久化时也只保存该摘要，绝不保存公钥本身。
+func KeyDigest(publicKey []byte) string {
+	sum := sha256.Sum256(publicKey)
+	return hex.EncodeToString(sum[:])
+}

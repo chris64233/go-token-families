@@ -20,6 +20,16 @@ type Family struct {
 	RevokedAt *time.Time `json:"revoked_at,omitempty"`
 	// Reason 记录撤销原因（"manual" / "replay"），便于审计。
 	Reason string `json:"reason,omitempty"`
+
+	// DeviceID 是当前绑定设备的标识。
+	DeviceID string `json:"device_id"`
+	// DeviceKeyDigest 是当前绑定设备公钥的不可逆摘要；公钥本身绝不持久化。
+	DeviceKeyDigest string `json:"device_key_digest"`
+	// BindingVersion 是设备绑定版本，登录时为 1，每次设备更换提交后递增。
+	// 访问令牌记录签发时的版本，校验时必须与家族当前版本一致。
+	BindingVersion int `json:"binding_version"`
+	// BoundAt 是当前绑定建立的时间。
+	BoundAt time.Time `json:"bound_at"`
 }
 
 // RefreshTokenRecord 是刷新令牌的持久化记录，以摘要为键。
@@ -38,13 +48,52 @@ type AccessTokenRecord struct {
 	FamilyID  string    `json:"family_id"`
 	UserID    string    `json:"user_id"`
 	ExpiresAt time.Time `json:"expires_at"`
+	// BindingVersion 是签发时家族的设备绑定版本。
+	BindingVersion int `json:"binding_version"`
 }
 
-// State 是服务的全部持久化状态。其中只包含令牌摘要，不包含任何令牌明文。
+// DeviceChange 是一次设备更换确认流程的持久化记录。
+// 其中只包含设备标识、公钥摘要与防重放随机因子，
+// 不包含任何公钥、签名或令牌明文。
+type DeviceChange struct {
+	ChangeID    string `json:"change_id"`
+	FamilyID    string `json:"family_id"`
+	NewDeviceID string `json:"new_device_id"`
+	// NewKeyDigest 是新设备公钥的不可逆摘要。
+	NewKeyDigest string `json:"new_key_digest"`
+	// Nonce 是本次尝试的随机防重放因子，确认与证明的签名消息必须包含它；
+	// 重新发起时会更换，使旧流程的迟到确认对新流程无效。
+	Nonce     string    `json:"nonce"`
+	CreatedAt time.Time `json:"created_at"`
+	ExpiresAt time.Time `json:"expires_at"`
+	// OldConfirmed 表示旧设备已确认更换。
+	OldConfirmed bool `json:"old_confirmed"`
+	// NewProved 表示新设备已证明持有私钥。
+	NewProved bool `json:"new_proved"`
+	// Committed 表示更换已原子提交（绑定切换 + 刷新令牌轮换）。
+	Committed   bool       `json:"committed"`
+	CommittedAt *time.Time `json:"committed_at,omitempty"`
+}
+
+// SecurityEvent 是一条可查询的安全事件，只包含非敏感元数据。
+type SecurityEvent struct {
+	Type     string    `json:"type"`
+	At       time.Time `json:"at"`
+	FamilyID string    `json:"family_id"`
+	Detail   string    `json:"detail,omitempty"`
+	// BindingVersion 是事件发生时的设备绑定版本。
+	BindingVersion int `json:"binding_version"`
+}
+
+// State 是服务的全部持久化状态。其中只包含令牌与公钥的不可逆摘要，
+// 不包含任何令牌明文、公钥、私钥或签名。
 type State struct {
 	Families      map[string]*Family             `json:"families"`
 	RefreshTokens map[string]*RefreshTokenRecord `json:"refresh_tokens"`
 	AccessTokens  map[string]*AccessTokenRecord  `json:"access_tokens"`
+	DeviceChanges map[string]*DeviceChange       `json:"device_changes"`
+	// Events 以家族 ID 为键的安全事件日志，每个家族保留最近若干条。
+	Events map[string][]SecurityEvent `json:"events"`
 }
 
 func newState() *State {
@@ -52,6 +101,8 @@ func newState() *State {
 		Families:      make(map[string]*Family),
 		RefreshTokens: make(map[string]*RefreshTokenRecord),
 		AccessTokens:  make(map[string]*AccessTokenRecord),
+		DeviceChanges: make(map[string]*DeviceChange),
+		Events:        make(map[string][]SecurityEvent),
 	}
 }
 
@@ -140,6 +191,12 @@ func (f *FileStore) Load() (*State, error) {
 	}
 	if st.AccessTokens == nil {
 		st.AccessTokens = make(map[string]*AccessTokenRecord)
+	}
+	if st.DeviceChanges == nil {
+		st.DeviceChanges = make(map[string]*DeviceChange)
+	}
+	if st.Events == nil {
+		st.Events = make(map[string][]SecurityEvent)
 	}
 	return &st, nil
 }
