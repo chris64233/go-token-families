@@ -63,9 +63,11 @@ type AccessClaims struct {
 
 // idemEntry 是幂等重试缓存项，仅存于内存，生命周期不超过幂等窗口。
 type idemEntry struct {
-	tokenDigest string
-	pair        TokenPair
-	expiresAt   time.Time
+	tokenDigest   string
+	familyID      string
+	deviceVersion int
+	pair          TokenPair
+	expiresAt     time.Time
 }
 
 // Service 提供登录签发、刷新轮换、主动撤销与访问令牌校验。
@@ -98,10 +100,14 @@ func NewService(store Store, cfg Config) (*Service, error) {
 	}, nil
 }
 
-// Login 创建一个新的令牌家族，并签发第一代访问令牌与刷新令牌。
-func (s *Service) Login(userID string) (*TokenPair, error) {
+// Login 创建一个新的令牌家族，绑定指定设备，并签发第一代访问令牌与刷新令牌。
+// 同一用户在不同设备上登录会创建相互独立的家族。
+func (s *Service) Login(userID, deviceID string) (*TokenPair, error) {
 	if userID == "" {
 		return nil, fmt.Errorf("tokenfamilies: user id must not be empty")
+	}
+	if deviceID == "" {
+		return nil, fmt.Errorf("tokenfamilies: device id must not be empty")
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -112,27 +118,34 @@ func (s *Service) Login(userID string) (*TokenPair, error) {
 	}
 	now := s.cfg.Clock.Now()
 	s.state.Families[familyID] = &Family{
-		ID:        familyID,
-		UserID:    userID,
-		CreatedAt: now,
+		ID:            familyID,
+		UserID:        userID,
+		DeviceID:      deviceID,
+		DeviceVersion: 1,
+		CreatedAt:     now,
 	}
-	pair, err := s.issueLocked(familyID, userID, 1, now)
+	fam := s.state.Families[familyID]
+	pair, err := s.issueLocked(fam, 1, now)
 	if err != nil {
 		return nil, err
 	}
 	if err := s.persistLocked(); err != nil {
 		return nil, err
 	}
-	s.cfg.Logger.Info("token family created", "family_id", familyID, "user_id", userID)
+	s.cfg.Logger.Info("token family created", "family_id", familyID, "user_id", userID, "device_id", deviceID)
 	return pair, nil
 }
 
 // Refresh 用当前刷新令牌轮换出下一代令牌对。
 //
+//   - 刷新在同一把锁下锁定令牌家族、设备绑定与当前序号：
+//     令牌签发时记录的设备绑定版本必须与家族当前版本一致；
 //   - 刷新成功后旧刷新令牌立即一次性失效；
 //   - idempotencyKey 非空时，窗口内同一键 + 同一旧令牌的重试返回相同结果；
-//     同一键搭配不同令牌返回 ErrIdempotencyConflict；
-//   - 已失效的旧令牌被再次使用视为重放，撤销整个家族并返回 ErrReplayDetected。
+//     同一键搭配不同令牌、或重试时设备绑定版本已变化，返回 ErrIdempotencyConflict；
+//   - 已失效的旧令牌被再次使用视为重放，撤销整个家族并返回 ErrReplayDetected；
+//   - 重放先被发现时，随后到达的合法刷新只能观察到撤销原因（ErrFamilyRevoked），
+//     不会重新开启新链。
 func (s *Service) Refresh(refreshToken, idempotencyKey string) (*TokenPair, error) {
 	if refreshToken == "" {
 		return nil, ErrInvalidToken
@@ -148,6 +161,10 @@ func (s *Service) Refresh(refreshToken, idempotencyKey string) (*TokenPair, erro
 		if entry, ok := s.idem[idempotencyKey]; ok {
 			if entry.tokenDigest != dgst {
 				return nil, fmt.Errorf("tokenfamilies: idempotency key reused with a different refresh token: %w", ErrIdempotencyConflict)
+			}
+			fam := s.state.Families[entry.familyID]
+			if fam == nil || fam.DeviceVersion != entry.deviceVersion {
+				return nil, fmt.Errorf("tokenfamilies: idempotency key reused after device binding changed: %w", ErrIdempotencyConflict)
 			}
 			pair := entry.pair
 			return &pair, nil
@@ -165,14 +182,18 @@ func (s *Service) Refresh(refreshToken, idempotencyKey string) (*TokenPair, erro
 	if fam.Revoked {
 		return nil, fmt.Errorf("tokenfamilies: family %s revoked (%s): %w", fam.ID, fam.Reason, ErrFamilyRevoked)
 	}
+	if rec.DeviceID != fam.DeviceID || rec.DeviceVersion != fam.DeviceVersion {
+		return nil, fmt.Errorf("tokenfamilies: device binding changed for family %s: %w", fam.ID, ErrDeviceBindingChanged)
+	}
 	if rec.Consumed {
 		// 旧令牌被再次使用：判定为重放，撤销整个家族。
-		s.revokeLocked(fam, "replay", now)
+		ev := s.replayRevokeLocked(fam, rec.Generation, now)
 		if err := s.persistLocked(); err != nil {
 			return nil, err
 		}
-		s.cfg.Logger.Warn("refresh token replay detected, family revoked", "family_id", fam.ID)
-		return nil, fmt.Errorf("tokenfamilies: family %s revoked due to replay: %w", fam.ID, ErrReplayDetected)
+		s.cfg.Logger.Warn("refresh token replay detected, family revoked",
+			"family_id", fam.ID, "event_seq", ev.Seq, "generation", rec.Generation, "device_id", rec.DeviceID)
+		return nil, fmt.Errorf("tokenfamilies: family %s revoked due to replay (event %d): %w", fam.ID, ev.Seq, ErrReplayDetected)
 	}
 	if !now.Before(rec.ExpiresAt) {
 		return nil, fmt.Errorf("tokenfamilies: refresh token expired at %s: %w", rec.ExpiresAt.UTC().Format(time.RFC3339), ErrTokenExpired)
@@ -181,7 +202,7 @@ func (s *Service) Refresh(refreshToken, idempotencyKey string) (*TokenPair, erro
 	// 轮换：旧令牌一次性失效，签发下一代令牌对。
 	rec.Consumed = true
 	rec.ConsumedAt = &now
-	pair, err := s.issueLocked(fam.ID, fam.UserID, rec.Generation+1, now)
+	pair, err := s.issueLocked(fam, rec.Generation+1, now)
 	if err != nil {
 		return nil, err
 	}
@@ -190,9 +211,11 @@ func (s *Service) Refresh(refreshToken, idempotencyKey string) (*TokenPair, erro
 	}
 	if idempotencyKey != "" {
 		s.idem[idempotencyKey] = &idemEntry{
-			tokenDigest: dgst,
-			pair:        *pair,
-			expiresAt:   now.Add(s.cfg.IdempotencyWindow),
+			tokenDigest:   dgst,
+			familyID:      fam.ID,
+			deviceVersion: fam.DeviceVersion,
+			pair:          *pair,
+			expiresAt:     now.Add(s.cfg.IdempotencyWindow),
 		}
 	}
 	return pair, nil
@@ -211,11 +234,44 @@ func (s *Service) RevokeFamily(familyID string) error {
 	if fam.Revoked {
 		return nil // 幂等：重复撤销不报错
 	}
-	s.revokeLocked(fam, "manual", s.cfg.Clock.Now())
+	now := s.cfg.Clock.Now()
+	ev := s.appendEventLocked(EventTypeRevoke, fam, fam.Generation, "manual", now)
+	s.revokeLocked(fam, "manual", ev.Seq, now)
 	if err := s.persistLocked(); err != nil {
 		return err
 	}
-	s.cfg.Logger.Info("token family revoked", "family_id", fam.ID, "reason", fam.Reason)
+	s.cfg.Logger.Info("token family revoked", "family_id", fam.ID, "reason", fam.Reason, "event_seq", ev.Seq)
+	return nil
+}
+
+// UnbindDevice 解除家族的设备绑定：设备绑定版本递增，该设备签发的
+// 所有刷新令牌立即失效；若家族尚未撤销，则同时以 "device_unbind" 原因撤销。
+// 解绑与撤销都会记录事件，保留二者的先后关系；家族已被撤销时
+// 解绑只追加解绑事件，不会覆盖原有撤销原因，也不能恢复已撤销的家族。
+func (s *Service) UnbindDevice(familyID string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	fam, ok := s.state.Families[familyID]
+	if !ok {
+		return ErrFamilyNotFound
+	}
+	if fam.DeviceID == "" {
+		return nil // 幂等：重复解绑不报错
+	}
+	now := s.cfg.Clock.Now()
+	deviceID := fam.DeviceID
+	unbindEv := s.appendEventLocked(EventTypeDeviceUnbind, fam, fam.Generation, "", now)
+	fam.DeviceID = ""
+	fam.DeviceVersion++
+	if !fam.Revoked {
+		ev := s.appendEventLocked(EventTypeRevoke, fam, fam.Generation, "device_unbind", now)
+		s.revokeLocked(fam, "device_unbind", ev.Seq, now)
+	}
+	if err := s.persistLocked(); err != nil {
+		return err
+	}
+	s.cfg.Logger.Info("device unbound", "family_id", fam.ID, "device_id", deviceID, "event_seq", unbindEv.Seq)
 	return nil
 }
 
@@ -249,8 +305,9 @@ func (s *Service) ValidateAccessToken(accessToken string) (*AccessClaims, error)
 	}, nil
 }
 
-// issueLocked 生成并登记新一代令牌对。调用方必须持有 s.mu。
-func (s *Service) issueLocked(familyID, userID string, generation int, now time.Time) (*TokenPair, error) {
+// issueLocked 生成并登记新一代令牌对，同时推进家族当前序号。
+// 新令牌锁定家族当前的设备绑定。调用方必须持有 s.mu。
+func (s *Service) issueLocked(fam *Family, generation int, now time.Time) (*TokenPair, error) {
 	accessToken, err := newToken("at")
 	if err != nil {
 		return nil, err
@@ -262,19 +319,23 @@ func (s *Service) issueLocked(familyID, userID string, generation int, now time.
 	accessExp := now.Add(s.cfg.AccessTokenTTL)
 	refreshExp := now.Add(s.cfg.RefreshTokenTTL)
 	s.state.AccessTokens[digest(accessToken)] = &AccessTokenRecord{
-		Digest:    digest(accessToken),
-		FamilyID:  familyID,
-		UserID:    userID,
-		ExpiresAt: accessExp,
+		Digest:     digest(accessToken),
+		FamilyID:   fam.ID,
+		UserID:     fam.UserID,
+		Generation: generation,
+		ExpiresAt:  accessExp,
 	}
 	s.state.RefreshTokens[digest(refreshToken)] = &RefreshTokenRecord{
-		Digest:     digest(refreshToken),
-		FamilyID:   familyID,
-		Generation: generation,
-		ExpiresAt:  refreshExp,
+		Digest:        digest(refreshToken),
+		FamilyID:      fam.ID,
+		Generation:    generation,
+		DeviceID:      fam.DeviceID,
+		DeviceVersion: fam.DeviceVersion,
+		ExpiresAt:     refreshExp,
 	}
+	fam.Generation = generation
 	return &TokenPair{
-		FamilyID:              familyID,
+		FamilyID:              fam.ID,
 		AccessToken:           accessToken,
 		RefreshToken:          refreshToken,
 		AccessTokenExpiresAt:  accessExp,
@@ -283,10 +344,46 @@ func (s *Service) issueLocked(familyID, userID string, generation int, now time.
 }
 
 // revokeLocked 标记家族撤销。调用方必须持有 s.mu。
-func (s *Service) revokeLocked(fam *Family, reason string, now time.Time) {
+func (s *Service) revokeLocked(fam *Family, reason string, eventSeq int64, now time.Time) {
 	fam.Revoked = true
 	fam.RevokedAt = &now
 	fam.Reason = reason
+	fam.RevokedByEvent = eventSeq
+}
+
+// appendEventLocked 追加一条事件并返回。事件序号全局单调递增，
+// 用于保留重放、撤销与设备解绑之间的先后关系。调用方必须持有 s.mu。
+func (s *Service) appendEventLocked(eventType string, fam *Family, generation int, reason string, now time.Time) *Event {
+	ev := &Event{
+		Seq:        int64(len(s.state.Events)) + 1,
+		Type:       eventType,
+		FamilyID:   fam.ID,
+		DeviceID:   fam.DeviceID,
+		Generation: generation,
+		Reason:     reason,
+		At:         now,
+	}
+	s.state.Events = append(s.state.Events, ev)
+	return ev
+}
+
+// replayRevokeLocked 处理重放：记录重放事件、撤销家族，并把受影响的
+// 后续令牌（世代大于被重放令牌且尚未消费的令牌）标记到该重放事件上。
+// 此前已合法刷新的链路（已消费的令牌）保持原样。调用方必须持有 s.mu。
+func (s *Service) replayRevokeLocked(fam *Family, replayedGeneration int, now time.Time) *Event {
+	ev := s.appendEventLocked(EventTypeReplay, fam, replayedGeneration, "replay", now)
+	s.revokeLocked(fam, "replay", ev.Seq, now)
+	for _, rt := range s.state.RefreshTokens {
+		if rt.FamilyID == fam.ID && rt.Generation > replayedGeneration && !rt.Consumed {
+			rt.InvalidatedByEvent = ev.Seq
+		}
+	}
+	for _, at := range s.state.AccessTokens {
+		if at.FamilyID == fam.ID && at.Generation > replayedGeneration {
+			at.InvalidatedByEvent = ev.Seq
+		}
+	}
+	return ev
 }
 
 // persistLocked 将当前状态写入 Store。调用方必须持有 s.mu。

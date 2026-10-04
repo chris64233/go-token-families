@@ -13,31 +13,66 @@ import (
 
 // Family 表示一次登录创建的令牌家族。
 type Family struct {
-	ID        string     `json:"id"`
-	UserID    string     `json:"user_id"`
-	CreatedAt time.Time  `json:"created_at"`
-	Revoked   bool       `json:"revoked"`
-	RevokedAt *time.Time `json:"revoked_at,omitempty"`
-	// Reason 记录撤销原因（"manual" / "replay"），便于审计。
+	ID       string `json:"id"`
+	UserID   string `json:"user_id"`
+	DeviceID string `json:"device_id"`
+	// DeviceVersion 是设备绑定版本：每次绑定/解绑单调递增。
+	// 刷新令牌在签发时记录当时的版本，版本变化后旧令牌不再可用。
+	DeviceVersion int `json:"device_version"`
+	// Generation 是家族当前的最高世代（序号），随每次轮换递增。
+	Generation int        `json:"generation"`
+	CreatedAt  time.Time  `json:"created_at"`
+	Revoked    bool       `json:"revoked"`
+	RevokedAt  *time.Time `json:"revoked_at,omitempty"`
+	// Reason 记录撤销原因（"manual" / "replay" / "device_unbind"），便于审计。
 	Reason string `json:"reason,omitempty"`
+	// RevokedByEvent 是触发撤销的事件序号，便于定位撤销来源。
+	RevokedByEvent int64 `json:"revoked_by_event,omitempty"`
 }
 
 // RefreshTokenRecord 是刷新令牌的持久化记录，以摘要为键。
 type RefreshTokenRecord struct {
-	Digest     string     `json:"digest"`
-	FamilyID   string     `json:"family_id"`
-	Generation int        `json:"generation"`
-	ExpiresAt  time.Time  `json:"expires_at"`
-	Consumed   bool       `json:"consumed"`
-	ConsumedAt *time.Time `json:"consumed_at,omitempty"`
+	Digest     string `json:"digest"`
+	FamilyID   string `json:"family_id"`
+	Generation int    `json:"generation"`
+	// DeviceID / DeviceVersion 记录签发时锁定的设备绑定。
+	DeviceID      string     `json:"device_id"`
+	DeviceVersion int        `json:"device_version"`
+	ExpiresAt     time.Time  `json:"expires_at"`
+	Consumed      bool       `json:"consumed"`
+	ConsumedAt    *time.Time `json:"consumed_at,omitempty"`
+	// InvalidatedByEvent 记录使该令牌失效的重放事件序号（仅重放撤销时设置）。
+	InvalidatedByEvent int64 `json:"invalidated_by_event,omitempty"`
 }
 
 // AccessTokenRecord 是访问令牌的持久化记录，以摘要为键。
 type AccessTokenRecord struct {
-	Digest    string    `json:"digest"`
-	FamilyID  string    `json:"family_id"`
-	UserID    string    `json:"user_id"`
-	ExpiresAt time.Time `json:"expires_at"`
+	Digest     string    `json:"digest"`
+	FamilyID   string    `json:"family_id"`
+	UserID     string    `json:"user_id"`
+	Generation int       `json:"generation"`
+	ExpiresAt  time.Time `json:"expires_at"`
+	// InvalidatedByEvent 记录使该令牌失效的重放事件序号（仅重放撤销时设置）。
+	InvalidatedByEvent int64 `json:"invalidated_by_event,omitempty"`
+}
+
+// 事件类型。事件用于保留重放、撤销、设备解绑之间的先后关系。
+const (
+	EventTypeReplay       = "replay"
+	EventTypeRevoke       = "revoke"
+	EventTypeDeviceUnbind = "device_unbind"
+)
+
+// Event 是家族生命周期内的一次状态变更记录。
+// 序号 Seq 全局单调递增，用于表达事件之间的先后关系。
+type Event struct {
+	Seq        int64     `json:"seq"`
+	Type       string    `json:"type"`
+	FamilyID   string    `json:"family_id"`
+	DeviceID   string    `json:"device_id,omitempty"`
+	Generation int       `json:"generation,omitempty"`
+	Reason     string    `json:"reason,omitempty"`
+	At         time.Time `json:"at"`
 }
 
 // State 是服务的全部持久化状态。其中只包含令牌摘要，不包含任何令牌明文。
@@ -45,6 +80,8 @@ type State struct {
 	Families      map[string]*Family             `json:"families"`
 	RefreshTokens map[string]*RefreshTokenRecord `json:"refresh_tokens"`
 	AccessTokens  map[string]*AccessTokenRecord  `json:"access_tokens"`
+	// Events 只追加不删除，Seq 即其在切片中的位置（从 1 开始）。
+	Events []*Event `json:"events,omitempty"`
 }
 
 func newState() *State {
