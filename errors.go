@@ -22,6 +22,10 @@ var (
 	// ErrIdempotencyConflict 表示同一幂等键被用于不同的刷新请求。
 	ErrIdempotencyConflict = errors.New("tokenfamilies: idempotency key conflict")
 
+	// ErrDeviceBindingChanged 表示刷新令牌签发时锁定的设备绑定
+	// 与家族当前的设备绑定不一致（设备已解绑或重新绑定）。
+	ErrDeviceBindingChanged = errors.New("tokenfamilies: device binding changed")
+
 	// ErrFamilyNotFound 表示指定的令牌家族不存在。
 	ErrFamilyNotFound = errors.New("tokenfamilies: token family not found")
 )
